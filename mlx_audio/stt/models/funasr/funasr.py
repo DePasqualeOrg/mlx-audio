@@ -6,24 +6,35 @@
 """
 Fun-ASR-Nano model implementation for MLX.
 
-This is the main model class that integrates:
-- Audio frontend (mel spectrogram + LFR)
+The model combines:
+- Audio frontend (kaldi-style mel filterbank + LFR frame stacking)
 - SenseVoice encoder (SANM-based)
-- Audio adaptor (projects to LLM space)
+- Audio adaptor (encoder_dim -> llm_dim projection + transformer blocks)
 - Qwen3 LLM decoder
+
+Inference follows upstream PyTorch (`fun_asr_nano/model.py`):
+- The system message is the literal Qwen3 default ``"You are a helpful assistant."``.
+- The user message is a Chinese instruction (``语音转写：`` or
+  ``语音转写成{language}：``) followed by the audio embeddings.
+- The audio embeddings are spliced directly into the LLM input embedding
+  stream — the literal speech-marker strings are never tokenized and never
+  reach the LLM, because they decompose to multi-piece BPE.
+- When ``use_low_frame_rate`` is set on the adaptor, only the first
+  ``fake_token_len`` frames of the adaptor output are consumed.
 """
 
-import glob
 import json
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_audio.stt.utils import get_model_path, load_audio
+from mlx_audio.stt.utils import get_model_path
 
 from .adaptor import AudioAdaptor, AudioAdaptorConfig
 from .audio import LFR_M, LFR_N, N_MELS, SAMPLE_RATE, preprocess_audio
@@ -36,17 +47,42 @@ class STTOutput:
     """Output from speech-to-text generation."""
 
     text: str
-    segments: List[dict] = None
-    language: str = None
-    task: str = None
-    duration: float = None
-    tokens: List[int] = None
+    segments: Optional[List[dict]] = None
+    language: Optional[str] = None
+    task: Optional[str] = None
+    duration: Optional[float] = None
+    tokens: Optional[List[int]] = None
 
 
-# Supported languages for Fun-ASR (based on Qwen3's multilingual capabilities)
+# Task types
+TASK_TRANSCRIBE = "transcribe"
+TASK_TRANSLATE = "translate"
+
+# Language codes -> Chinese display names used in the upstream prompt template.
+# Upstream `fun_asr_nano/model.py::get_prompt` interpolates the language name
+# directly into ``语音转写成{language}：``. Unknown codes fall through to
+# ``语音转写：`` (no language hint).
+LANGUAGE_PROMPT_NAMES = {
+    "zh": "中文",
+    "en": "英语",
+    "ja": "日语",
+    "ko": "韩语",
+    "es": "西班牙语",
+    "fr": "法语",
+    "de": "德语",
+    "it": "意大利语",
+    "pt": "葡萄牙语",
+    "ru": "俄语",
+    "ar": "阿拉伯语",
+    "th": "泰语",
+    "vi": "越南语",
+    "yue": "粤语",
+}
+
+# English-display-name lookup. Documentation only — does not affect prompting.
 SUPPORTED_LANGUAGES = {
-    "en": "English",
     "zh": "Chinese",
+    "en": "English",
     "ja": "Japanese",
     "ko": "Korean",
     "es": "Spanish",
@@ -58,12 +94,9 @@ SUPPORTED_LANGUAGES = {
     "ar": "Arabic",
     "th": "Thai",
     "vi": "Vietnamese",
+    "yue": "Cantonese",
     "auto": "Auto-detect",
 }
-
-# Task types
-TASK_TRANSCRIBE = "transcribe"
-TASK_TRANSLATE = "translate"
 
 
 @dataclass
@@ -87,7 +120,7 @@ class FunASRConfig:
     # LLM config
     llm: Qwen3Config = field(default_factory=lambda: Qwen3Config())
 
-    # Special tokens
+    # Special token strings
     sos_token: str = "<|startofspeech|>"
     eos_token: str = "<|endofspeech|>"
     im_start_token: str = "<|im_start|>"
@@ -113,13 +146,16 @@ class FunASRConfig:
         )
 
         adaptor_config = AudioAdaptorConfig(
-            downsample_rate=config_dict.get("adaptor", {}).get("downsample_rate", 2),
+            downsample_rate=config_dict.get("adaptor", {}).get("downsample_rate", 1),
             encoder_dim=config_dict.get("adaptor", {}).get("encoder_dim", 512),
             llm_dim=config_dict.get("adaptor", {}).get("llm_dim", 1024),
             ffn_dim=config_dict.get("adaptor", {}).get("ffn_dim", 2048),
             n_layer=config_dict.get("adaptor", {}).get("n_layer", 2),
             attention_heads=config_dict.get("adaptor", {}).get("attention_heads", 8),
             dropout=config_dict.get("adaptor", {}).get("dropout", 0.0),
+            use_low_frame_rate=config_dict.get("adaptor", {}).get(
+                "use_low_frame_rate", True
+            ),
         )
 
         llm_config = Qwen3Config(
@@ -139,9 +175,9 @@ class FunASRConfig:
             rope_theta=config_dict.get("llm", {}).get("rope_theta", 1000000.0),
             rms_norm_eps=config_dict.get("llm", {}).get("rms_norm_eps", 1e-6),
             tie_word_embeddings=config_dict.get("llm", {}).get(
-                "tie_word_embeddings", True
+                "tie_word_embeddings", False
             ),
-            head_dim=config_dict.get("llm", {}).get("head_dim", 64),
+            head_dim=config_dict.get("llm", {}).get("head_dim", 128),
         )
 
         return cls(
@@ -165,241 +201,176 @@ class Model(nn.Module):
     """
     Fun-ASR-Nano main model.
 
-    Combines audio encoder, adaptor, and LLM decoder for end-to-end
-    speech recognition.
+    Combines audio encoder, adaptor, and LLM decoder for end-to-end speech
+    recognition. Inference path mirrors upstream PyTorch
+    (`fun_asr_nano/model.py`): system + user prompt with embedded audio,
+    optionally sliced to ``fake_token_len`` when ``use_low_frame_rate=True``.
     """
 
     def __init__(self, config: FunASRConfig):
         super().__init__()
         self.config = config
 
-        # Audio encoder
         self.audio_encoder = SenseVoiceEncoder(config.encoder)
-
-        # Audio adaptor
         self.audio_adaptor = AudioAdaptor(config.adaptor)
-
-        # LLM decoder
         self.llm = Qwen3ForCausalLM(config.llm)
 
-        # Tokenizer (will be set during loading)
+        # Tokenizer (set during loading)
         self._tokenizer = None
 
-        # Special token IDs (will be set during loading)
-        self._sos_token_id = None
-        self._eos_token_id = None
-        self._eos_token_ids = None
+        # Token IDs that signal end-of-generation. Only single-ID encodings
+        # are added — the speech markers (``<|startofspeech|>`` etc.) are NOT
+        # added tokens; they decompose to multi-piece BPE and must never be
+        # treated as stop tokens.
+        self._eos_token_ids: set = set()
+
+    # ------------------------------------------------------------------
+    # Audio encoding
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fake_token_len(lfr_frame_count: int) -> int:
+        """
+        Number of audio tokens the LLM expects when ``use_low_frame_rate=True``.
+
+        Mirrors upstream ``fun_asr_nano/model.py``: three successive
+        ``1 + (x - 1) // 2`` reductions on the LFR frame count, with the last
+        one expressed as ``(x - 1) // 2 + 1``.
+        """
+        olens1 = 1 + (lfr_frame_count - 1) // 2
+        olens2 = 1 + (olens1 - 1) // 2
+        return (olens2 - 1) // 2 + 1
 
     def encode_audio(
         self,
-        audio: Union[str, np.ndarray, mx.array],
+        audio: Union[str, np.ndarray, mx.array, Path],
     ) -> mx.array:
         """
-        Encode audio to embeddings.
+        Encode audio to LLM-space embeddings, sliced to ``fake_token_len``
+        when ``use_low_frame_rate`` is enabled on the adaptor.
 
-        Parameters
-        ----------
-        audio : Union[str, np.ndarray, mx.array]
-            Audio input (path or waveform)
-
-        Returns
-        -------
-        mx.array
-            Audio embeddings projected to LLM space
+        Returns shape ``(1, audio_token_len, llm_dim)``.
         """
-        # Preprocess audio
+        if isinstance(audio, Path):
+            audio = str(audio)
+
+        # CMVN is intentionally disabled — the upstream Fun-ASR-Nano-2512
+        # config has ``cmvn_file: null``, so per-utterance normalization
+        # would shift the feature distribution away from training.
         features = preprocess_audio(
             audio,
             n_mels=self.config.n_mels,
             lfr_m=self.config.lfr_m,
             lfr_n=self.config.lfr_n,
+            apply_normalization=False,
         )
 
-        # Add batch dimension
         if features.ndim == 2:
-            features = features[None, ...]
+            batched = features[None, ...]
+        else:
+            batched = features
 
-        # Encode
-        encoder_out, lengths = self.audio_encoder(features)
-
-        # Adapt to LLM space (adaptor returns tuple of (embeddings, lengths))
+        encoder_out, lengths = self.audio_encoder(batched)
         adapted, _ = self.audio_adaptor(encoder_out, lengths)
 
-        return adapted
+        # Slice to the audio-token count the LLM was trained to consume.
+        lfr_frame_count = features.shape[0]
+        if self.config.adaptor.use_low_frame_rate:
+            audio_token_len = self._fake_token_len(lfr_frame_count)
+        else:
+            audio_token_len = adapted.shape[1]
+        truncated_len = min(audio_token_len, adapted.shape[1])
+        return adapted[:, :truncated_len, :]
 
-    def _merge_embeddings(
-        self,
-        input_ids: mx.array,
-        audio_embeddings: mx.array,
-    ) -> mx.array:
-        """
-        Merge audio embeddings with text embeddings.
+    # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
 
-        The audio embeddings replace the speech token placeholder region.
-
-        Parameters
-        ----------
-        input_ids : mx.array
-            Token IDs with speech placeholders
-        audio_embeddings : mx.array
-            Encoded audio embeddings
-
-        Returns
-        -------
-        mx.array
-            Combined embeddings
-        """
-        # Get text embeddings
-        text_embeddings = self.llm.get_input_embeddings()(input_ids)
-
-        # Find speech token positions
-        sos_id = self._sos_token_id
-        eos_id = self._eos_token_id
-
-        batch_size = input_ids.shape[0]
-        all_embeddings = []
-
-        for b in range(batch_size):
-            ids = input_ids[b]
-            text_emb = text_embeddings[b]
-            audio_emb = (
-                audio_embeddings[b] if audio_embeddings.ndim == 3 else audio_embeddings
-            )
-
-            # Find SOS and EOS positions
-            sos_mask = ids == sos_id
-            eos_mask = ids == eos_id
-
-            # Convert to numpy for finding positions
-            sos_positions = mx.argmax(sos_mask.astype(mx.int32)).item()
-            eos_positions = mx.argmax(eos_mask.astype(mx.int32)).item()
-
-            # Build merged embeddings
-            # [text_before_sos, sos_emb, audio_emb, eos_emb, text_after_eos]
-            parts = []
-
-            # Text before SOS (including SOS)
-            if sos_positions >= 0:
-                parts.append(text_emb[: sos_positions + 1])
-
-            # Audio embeddings
-            parts.append(audio_emb)
-
-            # Text from EOS onwards
-            if eos_positions >= 0:
-                parts.append(text_emb[eos_positions:])
-
-            merged = mx.concatenate(parts, axis=0)
-            all_embeddings.append(merged)
-
-        # Pad to same length
-        max_len = max(e.shape[0] for e in all_embeddings)
-        padded = []
-        for emb in all_embeddings:
-            if emb.shape[0] < max_len:
-                padding = mx.zeros((max_len - emb.shape[0], emb.shape[1]))
-                emb = mx.concatenate([emb, padding], axis=0)
-            padded.append(emb)
-
-        return mx.stack(padded, axis=0)
-
-    def _build_system_prompt(
+    def _build_prompt_parts(
         self,
         task: str = TASK_TRANSCRIBE,
         language: str = "auto",
         target_language: str = "en",
         initial_prompt: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[List[int], List[int]]:
         """
-        Build the system prompt based on task and language settings.
+        Build the prompt as the pair of token sequences that go before and
+        after the audio embeddings.
 
-        Parameters
-        ----------
-        task : str
-            Task type: "transcribe" or "translate"
-        language : str
-            Source language (or "auto" for detection)
-        target_language : str
-            Target language for translation
-        initial_prompt : str, optional
-            Custom instructions to prepend
+        The upstream PyTorch reference (``fun_asr_nano/model.py::get_prompt``
+        and ``generate_chatml``) renders:
 
-        Returns
-        -------
-        str
-            System prompt for the LLM
+        ```
+        <|im_start|>system
+        You are a helpful assistant.<|im_end|>
+        <|im_start|>user
+        {prompt}<|startofspeech|>!{audio}<|endofspeech|><|im_end|>
+        <|im_start|>assistant
+        ```
+
+        where ``{prompt}`` is ``"语音转写："`` (auto) or
+        ``"语音转写成{lang}："`` (with a Chinese language name).
+
+        We never tokenize the speech markers — they decompose to BPE pieces
+        like ``<``/``|``/``start``/... in the Qwen3 tokenizer and were never
+        meant to be in the LLM input. Instead we tokenize the text up to and
+        after the marker span and splice the audio embeddings between them.
+
+        Returns ``(pre_ids, post_ids)``. The full LLM input is then
+        ``embed(pre_ids) + audio_embeddings + embed(post_ids)``.
         """
-        if task == TASK_TRANSLATE:
-            target_lang_name = SUPPORTED_LANGUAGES.get(target_language, target_language)
-            if language == "auto":
-                base_prompt = f"You are a speech translation assistant. Listen to the audio and translate the speech into {target_lang_name}. Output only the translation, nothing else."
-            else:
-                source_lang_name = SUPPORTED_LANGUAGES.get(language, language)
-                base_prompt = f"You are a speech translation assistant. The audio is in {source_lang_name}. Translate it into {target_lang_name}. Output only the translation, nothing else."
-        else:  # transcribe
-            if language == "auto":
-                base_prompt = "You are a speech recognition assistant. Transcribe the audio accurately. Output only the transcription, nothing else."
-            else:
-                lang_name = SUPPORTED_LANGUAGES.get(language, language)
-                base_prompt = f"You are a speech recognition assistant. The audio is in {lang_name}. Transcribe it accurately. Output only the transcription, nothing else."
+        # Single language slot in the upstream prompt — we repurpose it as
+        # the target language for the (best-effort) translate task.
+        prompt_lang = target_language if task == TASK_TRANSLATE else language
+        lang_name = LANGUAGE_PROMPT_NAMES.get(prompt_lang)
+
+        if lang_name is None:
+            user_instruction = "语音转写："
+        else:
+            user_instruction = f"语音转写成{lang_name}："
 
         if initial_prompt:
-            return f"{initial_prompt}\n\n{base_prompt}"
-        return base_prompt
+            user_instruction = f"{initial_prompt}\n\n{user_instruction}"
 
-    def _prepare_prompt(
-        self,
-        audio_embeddings: mx.array,
-        language: str = "auto",
-        task: str = TASK_TRANSCRIBE,
-        target_language: str = "en",
-        initial_prompt: Optional[str] = None,
-    ) -> mx.array:
-        """
-        Prepare input embeddings with prompt template.
-
-        Parameters
-        ----------
-        audio_embeddings : mx.array
-            Encoded audio embeddings
-        language : str
-            Source language for transcription (or "auto" for detection)
-        task : str
-            Task type: "transcribe" or "translate"
-        target_language : str
-            Target language for translation (default: "en")
-        initial_prompt : str, optional
-            Custom instructions or context to include
-
-        Returns
-        -------
-        mx.array
-            Input embeddings for generation
-        """
-        # Build system prompt based on task
-        system_prompt = self._build_system_prompt(
-            task=task,
-            language=language,
-            target_language=target_language,
-            initial_prompt=initial_prompt,
+        pre_text = (
+            f"{self.config.im_start_token}system\n"
+            "You are a helpful assistant."
+            f"{self.config.im_end_token}\n"
+            f"{self.config.im_start_token}user\n"
+            f"{user_instruction}"
+        )
+        post_text = (
+            f"{self.config.im_end_token}\n" f"{self.config.im_start_token}assistant\n"
         )
 
-        prompt_parts = [
-            f"{self.config.im_start_token}system\n{system_prompt}{self.config.im_end_token}",
-            f"{self.config.im_start_token}user\n",
-            f"{self.config.sos_token}{self.config.eos_token}",
-            f"{self.config.im_end_token}",
-            f"{self.config.im_start_token}assistant\n",
-        ]
-        prompt = "".join(prompt_parts)
+        pre_ids = self._tokenizer.encode(pre_text, add_special_tokens=False)
+        post_ids = self._tokenizer.encode(post_text, add_special_tokens=False)
+        return pre_ids, post_ids
 
-        # Tokenize
-        input_ids = mx.array([self._tokenizer.encode(prompt)])
+    def _splice_embeddings(
+        self,
+        pre_ids: List[int],
+        audio_embeddings: mx.array,
+        post_ids: List[int],
+    ) -> mx.array:
+        """
+        Embed the prompt token sequences and concatenate them around the
+        audio embeddings. Returns shape ``(1, total, llm_dim)``.
+        """
+        embed = self.llm.get_input_embeddings()
+        pre = embed(mx.array(pre_ids, dtype=mx.int32))
+        post = embed(mx.array(post_ids, dtype=mx.int32))
+        audio = (
+            audio_embeddings.squeeze(0)
+            if audio_embeddings.ndim == 3
+            else audio_embeddings
+        )
+        combined = mx.concatenate([pre, audio, post], axis=0)
+        return combined[None, ...]
 
-        # Merge audio embeddings
-        input_embeddings = self._merge_embeddings(input_ids, audio_embeddings)
-
-        return input_embeddings
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
 
     def _sample_next_token(
         self,
@@ -408,71 +379,48 @@ class Model(nn.Module):
         top_p: float = 0.95,
         top_k: int = 0,
     ) -> mx.array:
-        """
-        Sample next token from logits.
-
-        Parameters
-        ----------
-        logits : mx.array
-            Logits from the model
-        temperature : float
-            Sampling temperature (0 for greedy)
-        top_p : float
-            Top-p (nucleus) sampling threshold
-        top_k : int
-            Top-k sampling (0 to disable)
-
-        Returns
-        -------
-        mx.array
-            Sampled token ID
-        """
-        # Get logits for last position
+        """Sample a token from logits ``(batch, seq, vocab)``."""
         logits = logits[:, -1, :]
 
         if temperature == 0:
-            # Greedy decoding
             return mx.argmax(logits, axis=-1)
 
-        # Apply temperature
         logits = logits / temperature
 
-        # Apply top-k
         if top_k > 0:
             top_k_logits, top_k_indices = mx.topk(logits, k=top_k)
-            logits = mx.full_like(logits, float("-inf"))
-            logits = logits.at[..., top_k_indices].set(top_k_logits)
+            mask = mx.full_like(logits, float("-inf"))
+            mask = mask.at[..., top_k_indices].set(top_k_logits)
+            logits = mask
 
-        # Apply top-p (nucleus sampling)
         if top_p < 1.0:
             sorted_logits = mx.sort(logits, axis=-1)[:, ::-1]
             sorted_indices = mx.argsort(logits, axis=-1)[:, ::-1]
             cumulative_probs = mx.cumsum(mx.softmax(sorted_logits, axis=-1), axis=-1)
 
-            # Remove tokens with cumulative probability above threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift to keep at least one token
-            sorted_indices_to_remove = mx.concatenate(
+            sorted_to_remove = cumulative_probs > top_p
+            # Keep at least one token by shifting right.
+            sorted_to_remove = mx.concatenate(
                 [
                     mx.zeros((logits.shape[0], 1), dtype=mx.bool_),
-                    sorted_indices_to_remove[:, :-1],
+                    sorted_to_remove[:, :-1],
                 ],
                 axis=-1,
             )
-
             for b in range(logits.shape[0]):
-                indices_to_remove = sorted_indices[b][sorted_indices_to_remove[b]]
+                indices_to_remove = sorted_indices[b][sorted_to_remove[b]]
                 logits = logits.at[b, indices_to_remove].set(float("-inf"))
 
-        # Sample
         probs = mx.softmax(logits, axis=-1)
-        token = mx.random.categorical(mx.log(probs + 1e-10))
+        return mx.random.categorical(mx.log(probs + 1e-10))
 
-        return token
+    # ------------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------------
 
     def stream_generate(
         self,
-        audio: Union[str, np.ndarray, mx.array],
+        audio: Union[str, np.ndarray, mx.array, Path],
         *,
         max_tokens: int = 512,
         temperature: float = 0.0,
@@ -483,76 +431,40 @@ class Model(nn.Module):
         target_language: str = "en",
         initial_prompt: Optional[str] = None,
     ) -> Generator[Tuple[int, mx.array], None, None]:
-        """
-        Stream tokens during generation.
-
-        Parameters
-        ----------
-        audio : Union[str, np.ndarray, mx.array]
-            Audio input
-        max_tokens : int
-            Maximum tokens to generate
-        temperature : float
-            Sampling temperature
-        top_p : float
-            Top-p sampling threshold
-        top_k : int
-            Top-k sampling
-        language : str
-            Source language (or "auto" for detection)
-        task : str
-            Task type: "transcribe" or "translate"
-        target_language : str
-            Target language for translation
-        initial_prompt : str, optional
-            Custom instructions or context
-
-        Yields
-        ------
-        Tuple[int, mx.array]
-            Token ID and logits
-        """
-        # Encode audio
+        """Yield ``(token_id, logits)`` tuples until EOS or ``max_tokens``."""
         audio_embeddings = self.encode_audio(audio)
 
-        # Prepare initial embeddings with task-specific prompt
-        input_embeddings = self._prepare_prompt(
-            audio_embeddings,
-            language=language,
+        pre_ids, post_ids = self._build_prompt_parts(
             task=task,
+            language=language,
             target_language=target_language,
             initial_prompt=initial_prompt,
         )
+        input_embeddings = self._splice_embeddings(pre_ids, audio_embeddings, post_ids)
 
-        # Initialize cache
-        cache = None
+        cache: Optional[List] = None
 
-        # Compute first step (prefill)
+        # Prefill.
         logits, cache = self.llm(
             input_embeddings=input_embeddings,
             cache=cache,
         )
         mx.async_eval(logits, cache)
 
-        # Generate tokens
         for _ in range(max_tokens):
-            # Sample current token
             token = self._sample_next_token(logits, temperature, top_p, top_k)
 
-            # Prepare next input and start computing ahead (before extracting token ID)
-            input_embeddings = self.llm.get_input_embeddings()(token.reshape(1, 1))
+            # Run the next step before extracting the token ID, so the GPU
+            # work overlaps with the host-side ``.item()`` sync.
+            next_input = self.llm.get_input_embeddings()(token.reshape(1, 1))
             logits, cache = self.llm(
-                input_embeddings=input_embeddings,
+                input_embeddings=next_input,
                 cache=cache,
             )
-
-            # Pipeline: evaluate async while preparing next iteration
             mx.async_eval(logits, cache)
 
-            # NOW extract token ID - GPU is already computing next step
-            token_id = token.item()
+            token_id = int(token.item())
 
-            # Check for EOS
             if token_id in self._eos_token_ids:
                 break
 
@@ -562,8 +474,8 @@ class Model(nn.Module):
         self,
         audio: Union[str, np.ndarray, mx.array, Path],
         *,
-        max_tokens: int = None,
-        temperature: float = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
         top_p: float = 0.95,
         top_k: int = 0,
         language: str = "auto",
@@ -577,78 +489,40 @@ class Model(nn.Module):
         """
         Generate transcription or translation from audio.
 
-        This is an LLM-based speech recognition model that supports:
-        - Transcription in multiple languages
-        - Translation to a target language
-        - Custom prompting for specialized tasks
-
         Parameters
         ----------
-        audio : Union[str, np.ndarray, mx.array, Path]
-            Audio input (file path or waveform)
+        audio : str, Path, np.ndarray, or mx.array
+            Audio input (file path or waveform).
         max_tokens : int, optional
-            Maximum tokens to generate (default: from config)
+            Maximum tokens to generate (default: from config).
         temperature : float, optional
-            Sampling temperature, 0 for greedy (default: from config)
-        top_p : float
-            Top-p (nucleus) sampling threshold
-        top_k : int
-            Top-k sampling (0 to disable)
+            Sampling temperature; 0 for greedy (default: from config).
+        top_p, top_k : float, int
+            Nucleus / top-k sampling parameters.
         language : str
-            Source language code (e.g., "en", "zh", "ja") or "auto" for detection.
-            Supported: en, zh, ja, ko, es, fr, de, it, pt, ru, ar, th, vi
+            Source language hint, or ``"auto"`` for no hint.
         task : str
-            Task type: "transcribe" (default) or "translate"
+            ``"transcribe"`` (default) or ``"translate"``. Translation reuses
+            the upstream prompt's single language slot to nudge the LLM
+            toward the target language; quality is best-effort since the
+            model wasn't trained for cross-lingual output.
         target_language : str
-            Target language for translation (default: "en")
+            Target language for translation (default ``"en"``).
         initial_prompt : str, optional
-            Custom instructions or context to guide the model.
-            Example: "This is a medical consultation." or "Technical vocabulary: API, SDK"
+            Prepended to the user instruction.
         verbose : bool
-            Print tokens as they're generated
+            Print tokens as they're generated.
         stream : bool
-            If True, return a generator yielding text chunks instead of waiting
-            for complete output
-
-        Returns
-        -------
-        STTOutput or Generator
-            If stream=False: STTOutput with text, language, task, and tokens
-            If stream=True: Generator yielding text chunks, final yield is STTOutput
-
-        Examples
-        --------
-        Basic transcription:
-            >>> result = model.generate("audio.wav")
-            >>> print(result.text)
-
-        Translation to English:
-            >>> result = model.generate("chinese_audio.wav", task="translate")
-            >>> print(result.text)
-
-        With custom context:
-            >>> result = model.generate(
-            ...     "meeting.wav",
-            ...     initial_prompt="Meeting participants: Alice, Bob. Topic: Q4 planning."
-            ... )
-
-        Streaming output:
-            >>> for chunk in model.generate("audio.wav", stream=True, verbose=True):
-            ...     pass  # chunks printed automatically when verbose=True
+            If True, return a generator yielding text chunks.
         """
-        import time
-
-        # Use config defaults if not specified
         if max_tokens is None:
             max_tokens = self.config.max_tokens
         if temperature is None:
             temperature = self.config.temperature
 
-        # Handle Path objects
         if isinstance(audio, Path):
             audio = str(audio)
 
-        # Track timing
         start_time = time.time()
 
         if stream:
@@ -665,8 +539,7 @@ class Model(nn.Module):
                 verbose=verbose,
             )
 
-        # Generate tokens
-        tokens = []
+        tokens: List[int] = []
         for token_id, _ in self.stream_generate(
             audio,
             max_tokens=max_tokens,
@@ -685,21 +558,13 @@ class Model(nn.Module):
         if verbose:
             print()
 
-        # Calculate duration
         duration = time.time() - start_time
+        text = self._clean_output(self._tokenizer.decode(tokens))
 
-        # Decode tokens
-        text = self._tokenizer.decode(tokens)
-
-        # Clean up text (remove thinking tokens, etc.)
-        text = self._clean_output(text)
-
-        # Determine detected language (for "auto" mode, we infer from output)
         detected_language = (
             language if language != "auto" else self._detect_language_from_text(text)
         )
 
-        # Clear memory
         mx.clear_cache()
 
         return STTOutput(
@@ -708,7 +573,7 @@ class Model(nn.Module):
             task=task,
             duration=duration,
             tokens=tokens,
-            segments=None,  # LLM-based model doesn't produce word-level timestamps
+            segments=None,
         )
 
     def _generate_stream(
@@ -725,11 +590,8 @@ class Model(nn.Module):
         verbose: bool,
     ) -> Generator[str, None, STTOutput]:
         """Internal streaming generator."""
-        import time
-
         start_time = time.time()
-        tokens = []
-        buffer = ""
+        tokens: List[int] = []
 
         for token_id, _ in self.stream_generate(
             audio,
@@ -744,7 +606,6 @@ class Model(nn.Module):
         ):
             tokens.append(token_id)
             chunk = self._tokenizer.decode([token_id])
-            buffer += chunk
 
             if verbose:
                 print(chunk, end="", flush=True)
@@ -762,7 +623,6 @@ class Model(nn.Module):
 
         mx.clear_cache()
 
-        # Final yield is the complete output
         return STTOutput(
             text=text,
             language=detected_language,
@@ -772,112 +632,70 @@ class Model(nn.Module):
             segments=None,
         )
 
-    def _detect_language_from_text(self, text: str) -> str:
-        """
-        Simple heuristic to detect language from output text.
+    # ------------------------------------------------------------------
+    # Output cleanup / language detection
+    # ------------------------------------------------------------------
 
-        For more accurate detection, consider using a dedicated language
-        detection library.
-        """
+    def _detect_language_from_text(self, text: str) -> str:
+        """Best-effort script-based language tag for the output text."""
         if not text:
             return "unknown"
 
-        # Simple character-based heuristics
-        # Check for CJK characters
-        cjk_count = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
-        japanese_count = sum(1 for c in text if "\u3040" <= c <= "\u30ff")
-        korean_count = sum(1 for c in text if "\uac00" <= c <= "\ud7af")
-        arabic_count = sum(1 for c in text if "\u0600" <= c <= "\u06ff")
-        thai_count = sum(1 for c in text if "\u0e00" <= c <= "\u0e7f")
-        cyrillic_count = sum(1 for c in text if "\u0400" <= c <= "\u04ff")
+        cjk = sum(1 for c in text if "一" <= c <= "鿿")
+        japanese = sum(1 for c in text if "぀" <= c <= "ヿ")
+        korean = sum(1 for c in text if "가" <= c <= "힯")
+        arabic = sum(1 for c in text if "؀" <= c <= "ۿ")
+        thai = sum(1 for c in text if "฀" <= c <= "๿")
+        cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
 
         total = len(text)
         if total == 0:
             return "unknown"
 
-        # Determine language based on script
-        if japanese_count / total > 0.1:
+        if japanese / total > 0.1:
             return "ja"
-        if korean_count / total > 0.1:
+        if korean / total > 0.1:
             return "ko"
-        if cjk_count / total > 0.2:
+        if cjk / total > 0.2:
             return "zh"
-        if arabic_count / total > 0.2:
+        if arabic / total > 0.2:
             return "ar"
-        if thai_count / total > 0.2:
+        if thai / total > 0.2:
             return "th"
-        if cyrillic_count / total > 0.2:
+        if cyrillic / total > 0.2:
             return "ru"
-
-        # Default to English for Latin script
         return "en"
 
     def _clean_output(self, text: str) -> str:
-        """
-        Clean up generated text.
-
-        Removes thinking blocks and other artifacts.
-
-        Parameters
-        ----------
-        text : str
-            Raw generated text
-
-        Returns
-        -------
-        str
-            Cleaned text
-        """
-        import re
-
-        # Remove thinking blocks
+        """Strip ``<think>`` blocks and any leaked special-token strings."""
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-
-        # Remove special tokens
-        special_tokens = [
+        for tok in [
             self.config.im_start_token,
             self.config.im_end_token,
             self.config.sos_token,
             self.config.eos_token,
             "<|endoftext|>",
-        ]
-        for token in special_tokens:
-            text = text.replace(token, "")
-
+        ]:
+            text = text.replace(tok, "")
         return text.strip()
+
+    # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
 
     def sanitize(self, weights: Dict) -> Dict:
         """
-        Sanitize weights for loading.
-
-        Handles Conv1d weight transposition and key remapping.
-
-        Parameters
-        ----------
-        weights : Dict
-            Raw weights dictionary
-
-        Returns
-        -------
-        Dict
-            Sanitized weights
+        Sanitize weights for loading. Handles Conv1d weight transposition.
         """
         sanitized = {}
         for k, v in weights.items():
-            # Handle FSMN conv weights (PyTorch: [out, 1, kernel] -> MLX: [out, kernel, 1])
             if "fsmn_block" in k and "conv.weight" in k:
-                # Check if transposition is needed
                 if v.ndim == 3 and v.shape[1] == 1:
                     v = v.squeeze(1)[..., None]
-            # Handle other conv weights
             elif "conv" in k and "weight" in k:
-                if v.ndim == 3:
-                    # Check shape to determine if transposition needed
-                    if v.shape[-1] < v.shape[-2]:
-                        v = v.swapaxes(-1, -2)
-
+                if v.ndim == 3 and v.shape[-1] < v.shape[-2]:
+                    v = v.swapaxes(-1, -2)
             sanitized[k] = v
-
         return sanitized
 
     @classmethod
@@ -888,44 +706,27 @@ class Model(nn.Module):
         dtype: mx.Dtype = mx.bfloat16,
         **kwargs,
     ) -> "Model":
-        """
-        Load model from pretrained weights.
-
-        Parameters
-        ----------
-        path_or_hf_repo : str
-            Local path or HuggingFace repository ID
-        dtype : mx.Dtype
-            Data type for model weights
-
-        Returns
-        -------
-        Model
-            Loaded model
-        """
+        """Load model from a local path or Hugging Face repo."""
         from transformers import AutoTokenizer
 
-        # Get model path
         revision = kwargs.get("revision", None)
         force_download = kwargs.get("force_download", False)
         model_path = get_model_path(
             path_or_hf_repo, revision=revision, force_download=force_download
         )
 
-        # Load config
         config_path = model_path / "config.json"
+        config_dict = {}
         if config_path.exists():
             with open(config_path, "r") as f:
                 config_dict = json.load(f)
             config = FunASRConfig.from_dict(config_dict)
         else:
-            # Use defaults
             config = FunASRConfig()
 
-        # Create model
         model = cls(config)
 
-        # Apply quantization if specified in config
+        # Apply quantization before loading weights if specified in config.
         if "quantization" in config_dict:
             q_config = config_dict["quantization"]
             q_bits = q_config.get("bits", 4)
@@ -933,7 +734,6 @@ class Model(nn.Module):
             q_components = set(q_config.get("quantized_components", []))
 
             def class_predicate(path: str, module) -> bool:
-                """Only quantize Linear layers in specified components."""
                 if isinstance(module, nn.Linear):
                     for component in q_components:
                         if component in path:
@@ -947,7 +747,7 @@ class Model(nn.Module):
                 class_predicate=class_predicate,
             )
 
-        # Load tokenizer
+        # Tokenizer.
         try:
             model._tokenizer = AutoTokenizer.from_pretrained(
                 path_or_hf_repo, trust_remote_code=True
@@ -957,21 +757,18 @@ class Model(nn.Module):
                 str(model_path), trust_remote_code=True
             )
 
-        # Set up special tokens
-        model._setup_special_tokens()
+        model._setup_eos_tokens()
 
-        # Load weights
+        # Weights.
         weight_files = list(model_path.glob("*.safetensors"))
         if not weight_files:
             weight_files = list(model_path.glob("*.npz"))
 
-        weights = {}
+        weights: Dict[str, mx.array] = {}
         for wf in weight_files:
             weights.update(mx.load(str(wf)))
 
-        # Cast to dtype (skip quantized weights which have specific dtypes)
         def should_cast(key: str, value: mx.array) -> bool:
-            # Don't cast quantization scales/biases or already-quantized weights
             if key.endswith((".scales", ".biases")):
                 return False
             if value.dtype == mx.uint32:  # Quantized weights
@@ -982,45 +779,37 @@ class Model(nn.Module):
             k: v.astype(dtype) if should_cast(k, v) else v for k, v in weights.items()
         }
 
-        # Load weights into model
         model.load_weights(list(weights.items()))
-
         model.eval()
 
         return model
 
-    def _setup_special_tokens(self):
-        """Set up special token IDs from tokenizer."""
+    def _setup_eos_tokens(self):
+        """
+        Build the set of token IDs that end generation.
+
+        Only IDs from strings that tokenize to a single token are added —
+        the speech markers (``<|startofspeech|>`` etc.) decompose to
+        multi-piece BPE in the Qwen3 tokenizer and must never be treated as
+        stop tokens.
+        """
         if self._tokenizer is None:
             return
 
-        # Get special token IDs
-        try:
-            self._sos_token_id = self._tokenizer.encode(
-                self.config.sos_token, add_special_tokens=False
-            )[0]
-        except Exception:
-            self._sos_token_id = None
+        eos_ids: set = set()
 
-        try:
-            self._eos_token_id = self._tokenizer.encode(
-                self.config.eos_token, add_special_tokens=False
-            )[0]
-        except Exception:
-            self._eos_token_id = None
+        if (
+            getattr(self._tokenizer, "eos_token_id", None) is not None
+            and self._tokenizer.eos_token_id >= 0
+        ):
+            eos_ids.add(self._tokenizer.eos_token_id)
 
-        # Set up EOS token IDs for stopping
-        self._eos_token_ids = set()
-        if hasattr(self._tokenizer, "eos_token_id") and self._tokenizer.eos_token_id:
-            self._eos_token_ids.add(self._tokenizer.eos_token_id)
-        if self._eos_token_id:
-            self._eos_token_ids.add(self._eos_token_id)
-
-        # Add common EOS tokens
-        for token in ["<|endoftext|>", "<|im_end|>", "</s>"]:
+        for tok in ["<|endoftext|>", "<|im_end|>", "</s>"]:
             try:
-                token_id = self._tokenizer.encode(token, add_special_tokens=False)
-                if token_id:
-                    self._eos_token_ids.add(token_id[0])
+                encoded = self._tokenizer.encode(tok, add_special_tokens=False)
             except Exception:
-                pass
+                continue
+            if len(encoded) == 1:
+                eos_ids.add(encoded[0])
+
+        self._eos_token_ids = eos_ids

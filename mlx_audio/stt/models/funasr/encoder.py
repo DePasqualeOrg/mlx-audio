@@ -34,6 +34,24 @@ class SenseVoiceEncoderConfig:
     dropout: float = 0.0
 
 
+def sinusoidal_position_encoding(
+    timesteps: int, depth: int, dtype: mx.Dtype = mx.float32
+) -> mx.array:
+    """Match upstream ``SinusoidalPositionEncoder``: 1-based positions,
+    ``log(10000)/(depth/2 - 1)`` log timescale increment, then concatenate
+    ``[sin, cos]`` along the feature axis. Returns shape ``(1, timesteps,
+    depth)`` so it broadcasts over the batch dimension."""
+    half_depth = depth // 2
+    log_timescale_increment = math.log(10000.0) / (half_depth - 1)
+    inv_timescales = mx.exp(
+        mx.arange(half_depth, dtype=mx.float32) * (-log_timescale_increment)
+    )
+    positions = mx.arange(1, timesteps + 1, dtype=mx.float32)
+    scaled_time = positions[:, None] * inv_timescales[None, :]
+    encoding = mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], axis=-1)
+    return encoding[None, :, :].astype(dtype)
+
+
 class MultiHeadedAttentionSANM(nn.Module):
     """
     Self-Attention with Memory (SANM).
@@ -392,8 +410,11 @@ class SenseVoiceEncoder(nn.Module):
         if lengths is None:
             lengths = mx.full((batch_size,), seq_len, dtype=mx.int32)
 
-        # Scale input by sqrt(output_size) - matches original
+        # Scale input by sqrt(output_size) and add sinusoidal position
+        # encoding (upstream ``SenseVoiceEncoderSmall.forward`` applies
+        # ``self.embed = SinusoidalPositionEncoder()`` after the scale).
         x = x * math.sqrt(self._output_size)
+        x = x + sinusoidal_position_encoding(seq_len, x.shape[-1], dtype=x.dtype)
 
         # Create attention mask from lengths if needed
         mask = None  # For full attention, no mask needed

@@ -270,13 +270,16 @@ def create_config(weights: Dict[str, np.ndarray]) -> Dict[str, Any]:
 
     # Infer adaptor config (matches AudioAdaptorConfig)
     adaptor_config = {
-        "downsample_rate": 2,
+        "downsample_rate": 1,
         "encoder_dim": 512,
         "llm_dim": 1024,
         "ffn_dim": 2048,
         "n_layer": 2,
         "attention_heads": 8,
         "dropout": 0.0,
+        # Architecture flag — not deducible from weights, hard-coded per the
+        # published Fun-ASR-Nano-2512 / MLT-Nano-2512 config.yaml.
+        "use_low_frame_rate": True,
     }
 
     for key, value in weights.items():

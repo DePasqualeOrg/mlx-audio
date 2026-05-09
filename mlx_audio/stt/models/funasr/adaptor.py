@@ -21,15 +21,25 @@ from .encoder import PositionwiseFeedForward
 
 @dataclass
 class AudioAdaptorConfig:
-    """Configuration for the audio adaptor."""
+    """Configuration for the audio adaptor.
 
-    downsample_rate: int = 2  # Downsample by grouping this many frames
+    Defaults match the published Fun-ASR-Nano-2512 (``downsample_rate: 1``,
+    ``use_low_frame_rate: true``).
+    """
+
+    downsample_rate: int = (
+        1  # Downsample by grouping this many frames (1 = no downsample)
+    )
     encoder_dim: int = 512  # Input dimension from encoder
     llm_dim: int = 1024  # Output dimension for LLM
     ffn_dim: int = 2048  # Intermediate projection dimension
     n_layer: int = 2  # Number of transformer blocks
     attention_heads: int = 8  # Attention heads
     dropout: float = 0.0
+    # When true, the LLM only consumes the first ``fake_token_len`` frames of
+    # the adaptor output. The count is computed as three successive
+    # ``1 + (T - 1) // 2`` reductions on the LFR frame count.
+    use_low_frame_rate: bool = True
 
 
 class MultiHeadedAttention(nn.Module):
@@ -259,12 +269,13 @@ def create_adaptor_from_config(config_dict: dict) -> AudioAdaptor:
         Initialized adaptor
     """
     config = AudioAdaptorConfig(
-        downsample_rate=config_dict.get("downsample_rate", 2),
+        downsample_rate=config_dict.get("downsample_rate", 1),
         encoder_dim=config_dict.get("encoder_dim", 512),
         llm_dim=config_dict.get("llm_dim", 1024),
         ffn_dim=config_dict.get("ffn_dim", 2048),
         n_layer=config_dict.get("n_layer", 2),
         attention_heads=config_dict.get("attention_heads", 8),
         dropout=config_dict.get("dropout", 0.0),
+        use_low_frame_rate=config_dict.get("use_low_frame_rate", True),
     )
     return AudioAdaptor(config)
